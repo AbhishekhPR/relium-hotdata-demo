@@ -1,0 +1,4 @@
+dbt-core==1.12.5
+dbt-duckdb==1.11.0
+pytest==9.1.1
+sqlglot==30.20.0

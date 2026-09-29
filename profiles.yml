@@ -1,0 +1,7 @@
+# dbt-duckdb is used only so `dbt compile` can render SQL; models are never run.
+relium_hotdata_demo:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: ":memory:"
