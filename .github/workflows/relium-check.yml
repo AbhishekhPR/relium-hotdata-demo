@@ -1,0 +1,94 @@
+name: Relium check
+
+on:
+  pull_request:
+    paths:
+      - "models/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: relium-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  relium:
+    name: Relium
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Relium diff
+        id: check
+        env:
+          HOTDATA_API_KEY: ${{ secrets.HOTDATA_API_KEY }}
+          HOTDATA_WORKSPACE_ID: ${{ secrets.HOTDATA_WORKSPACE_ID }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set +e
+          python -m relium_check.diff_runner \
+            --base-ref "origin/$BASE_REF" --head-ref HEAD \
+            --model customer_ltv --key customer_id
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      # Runs even if an earlier step failed (but not when cancelled), so an error still gets a comment.
+      - name: Post sticky PR comment
+        if: ${{ !cancelled() }}
+        uses: actions/github-script@v7
+        env:
+          EXIT_CODE: ${{ steps.check.outputs.exit_code }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- relium-check -->';
+            const code = process.env.EXIT_CODE;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const report = fs.existsSync('relium_report.md') ? fs.readFileSync('relium_report.md', 'utf8') : '';
+
+            let body;
+            if ((code === '0' || code === '1') && report) {
+              body = report;
+            } else {
+              // The diff runner writes an error report (no verdict) on exit 2; anything else
+              // (install failure, cancelled step) gets this generic message.
+              body = report || [
+                '# Relium check errored',
+                '',
+                'The check could not complete, so **this is not a verdict on the change**.',
+              ].join('\n');
+            }
+            body = `${marker}\n${body}\n\n<sub>[Workflow run](${runUrl})</sub>`;
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find(c => c.user?.type === 'Bot' && c.body?.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: "Relium: BLOCK"
+        if: ${{ !cancelled() && steps.check.outputs.exit_code == '1' }}
+        run: |
+          echo "::error title=Relium: BLOCK::customer_ltv output changed beyond the threshold. See the PR comment."
+          exit 1
+
+      - name: "Relium: error"
+        if: ${{ !cancelled() && steps.check.outputs.exit_code != '0' && steps.check.outputs.exit_code != '1' }}
+        run: |
+          echo "::error title=Relium: error::The check could not complete. This is not a verdict on the PR; see the logs."
+          exit 1
