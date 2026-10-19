@@ -1,3 +1,4 @@
+-- customer lifetime value per customer
 with payments as (
 
     select
