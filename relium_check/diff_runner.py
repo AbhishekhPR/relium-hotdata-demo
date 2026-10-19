@@ -21,6 +21,7 @@ import sys
 import tempfile
 import traceback
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,28 @@ EXIT_PASS, EXIT_BLOCK, EXIT_ERROR = 0, 1, 2
 
 class CheckError(Exception):
     """The check could not run; says nothing about the change under review."""
+
+
+# --- progress -------------------------------------------------------------------
+
+
+def _log(msg: str) -> None:
+    print(f"[relium] {msg}", flush=True)
+
+
+@contextmanager
+def _step(msg: str):
+    """Print `msg ... ` and leave the line open for the caller to finish with `_done`."""
+    print(f"[relium] {msg} ... ", end="", flush=True)
+    try:
+        yield
+    except BaseException:
+        print("failed", flush=True)
+        raise
+
+
+def _done(result: str) -> None:
+    print(result, flush=True)
 
 
 # --- compile --------------------------------------------------------------------
@@ -113,23 +136,29 @@ def load_seeds(client: hotdata.ApiClient, db_id: str, seeds: list[Path]) -> None
     databases = hotdata.DatabasesApi(client)
     for seed in seeds:
         upload = uploads.upload_file(str(seed), content_type="text/csv")
-        databases.load_database_table(
+        loaded = databases.load_database_table(
             db_id, SCHEMA, seed.stem,
             LoadManagedTableRequest(mode="replace", upload_id=upload.upload_id, format="csv"),
         )
+        _log(f"loaded {seed.stem}: {loaded.row_count} rows")
 
 
 @dataclass
 class Result:
     columns: list[str]
     rows: list[list[Any]]
+    execution_time_ms: int = 0
+
+
+DIALECT = "snowflake"
 
 
 def run_query(client: hotdata.ApiClient, db_id: str, sql: str) -> Result:
     resp = hotdata.QueryApi(client).query(
-        QueryRequest(sql=sql, dialect="snowflake"), x_database_id=db_id
+        QueryRequest(sql=sql, dialect=DIALECT), x_database_id=db_id
     )
-    return Result(columns=[c.lower() for c in resp.columns], rows=resp.rows)
+    return Result(columns=[c.lower() for c in resp.columns], rows=resp.rows,
+                  execution_time_ms=resp.execution_time_ms)
 
 
 # --- compare --------------------------------------------------------------------
@@ -322,22 +351,34 @@ def run(args: argparse.Namespace) -> tuple[str, bool]:
     if not seeds:
         raise CheckError(f"no seed CSVs in {repo / 'seeds'}")
 
-    sql = {ref: rewrite_sql(compile_model(repo, ref, args.model))
-           for ref in (args.base_ref, args.head_ref)}
+    sql = {}
+    for ref in (args.base_ref, args.head_ref):
+        with _step(f"compiling {args.model} @ {ref}"):
+            sql[ref] = rewrite_sql(compile_model(repo, ref, args.model))
+            _done("ok")
 
     with _client() as client:
-        db_id = create_seeded_database(client, seeds)
+        with _step("creating Hotdata database (expires in 24h)"):
+            db_id = create_seeded_database(client, seeds)
+            _done(db_id)
         try:
             load_seeds(client, db_id, seeds)
-            base = run_query(client, db_id, sql[args.base_ref])
-            head = run_query(client, db_id, sql[args.head_ref])
+            results = {}
+            for side, ref in (("base", args.base_ref), ("head", args.head_ref)):
+                with _step(f"running {side} query on Hotdata (dialect={DIALECT})"):
+                    res = results[side] = run_query(client, db_id, sql[ref])
+                    _done(f"{len(res.rows)} rows in {res.execution_time_ms} ms")
+            base, head = results["base"], results["head"]
+            with _step(f"comparing on {args.key}"):
+                metrics, differing = compare(base, head, args.key, args.threshold)
+                _done(f"{len(differing)} keys differ")
         finally:
             try:
                 hotdata.DatabasesApi(client).delete_database(db_id)
+                _log("deleted Hotdata database")
             except Exception as e:  # expires_at is the backstop
                 print(f"warning: failed to delete Hotdata database {db_id}: {e}", file=sys.stderr)
 
-    metrics, differing = compare(base, head, args.key, args.threshold)
     return render_report(args, metrics, differing, base, head)
 
 
